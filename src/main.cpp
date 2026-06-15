@@ -1,24 +1,22 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <DHT.h>
+#include <WiFiManager.h>
 
-// ============== КОНФИГУРАЦИЯ ПИНОВ ==============
-#define DHTPIN      4
-#define DHTTYPE     DHT22
-#define I2C_SDA     21
-#define I2C_SCL     22
-#define BMP180_ADDR 0x77
-
-// ============== КОНФИГУРАЦИЯ ПРИЛОЖЕНИЯ ==============
+// ============== КОНФИГУРАЦИЯ ==============
+#define DHTPIN          4
+#define DHTTYPE         DHT22
+#define I2C_SDA         21
+#define I2C_SCL         22
+#define BMP180_ADDR     0x77
 #define JSON_BUFFER_SIZE 128
-
-// ============== ИНТЕРВАЛ ОПРОСА ==============
-const unsigned long READ_INTERVAL = 10000;
+#define READ_INTERVAL   10000      // 10 секунд
 
 // ============== ОБЪЕКТЫ ==============
 DHT dht(DHTPIN, DHTTYPE);
+WiFiManager wm;
 
-// ============== BMP180 КАЛИБРОВОЧНЫЕ КОЭФФИЦИЕНТЫ ==============
+// ============== BMP180 КАЛИБРОВКА ==============
 int16_t AC1, AC2, AC3, B1_, B2_, MB, MC, MD;
 uint16_t AC4, AC5, AC6;
 bool bmpOk = false;
@@ -45,7 +43,7 @@ void bmpReadCalibration() {
   MD  = Wire.read() << 8 | Wire.read();
 }
 
-// ============== BMP180: ЧТЕНИЕ ДАВЛЕНИЯ В мм рт. ст. ==============
+// ============== BMP180: ДАВЛЕНИЕ ==============
 float bmpReadPressure() {
   Wire.beginTransmission(BMP180_ADDR);
   Wire.write(0xF4);
@@ -98,79 +96,111 @@ float bmpReadPressure() {
   return p / 133.322;
 }
 
-// ============== SETUP ==============
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println();
-  Serial.println("=== Dacha Weather Station v0.1 ===");
+// ============== СБОРКА JSON ==============
+void buildJson(char* buffer, size_t size) {
+  float temp    = dht.readTemperature();
+  float hum     = dht.readHumidity();
+  bool  dhtOk   = !(isnan(temp) || isnan(hum));
 
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Serial.println("[I2C] OK (SDA=21, SCL=22)");
-
-  dht.begin();
-  Serial.println("[AM2302] OK (GPIO 4)");
-
-  Wire.beginTransmission(BMP180_ADDR);
-  if (Wire.endTransmission() == 0) {
-    bmpReadCalibration();
-    bmpOk = true;
-    Serial.println("[BMP180] OK at 0x77");
-  } else {
-    Serial.println("[BMP180] NOT FOUND");
-  }
-  Serial.println();
-}
-
-// ============== LOOP ==============
-void loop() {
-  unsigned long now = millis();
-  if (now - lastRead < READ_INTERVAL) return;
-  lastRead = now;
-
-  // --- ЭТАП 1: ОПРОС ВСЕХ ДАТЧИКОВ ---
-  float temp     = dht.readTemperature();
-  float hum      = dht.readHumidity();
-  bool  dhtOk    = !(isnan(temp) || isnan(hum));
-
-  float press    = 0.0;
-  bool  pressOk  = false;
+  float press   = 0.0;
+  bool  pressOk = false;
   if (bmpOk) {
     press = bmpReadPressure();
     pressOk = (press > 0);
   }
 
-  // --- ЭТАП 2: СБОРКА СТРОКИ В ПАМЯТИ ---
-  char buffer[JSON_BUFFER_SIZE];  // буфер под JSON
   int pos = 0;
+  pos += snprintf(buffer + pos, size - pos, "{");
 
-  pos += snprintf(buffer + pos, sizeof(buffer) - pos, "{");
-
-  // Температура
   if (dhtOk) {
-    pos += snprintf(buffer + pos, sizeof(buffer) - pos, "\"temp\":%.1f", temp);
+    pos += snprintf(buffer + pos, size - pos, "\"temp\":%.1f", temp);
   } else {
-    pos += snprintf(buffer + pos, sizeof(buffer) - pos, "\"temp\":null");
+    pos += snprintf(buffer + pos, size - pos, "\"temp\":null");
   }
 
-  // Влажность
   if (dhtOk) {
-    pos += snprintf(buffer + pos, sizeof(buffer) - pos, ", \"hum\":%.1f", hum);
+    pos += snprintf(buffer + pos, size - pos, ", \"hum\":%.1f", hum);
   } else {
-    pos += snprintf(buffer + pos, sizeof(buffer) - pos, ", \"hum\":null");
+    pos += snprintf(buffer + pos, size - pos, ", \"hum\":null");
   }
 
-  // Давление
   if (pressOk) {
-    pos += snprintf(buffer + pos, sizeof(buffer) - pos, ", \"press\":%.1f", press);
+    pos += snprintf(buffer + pos, size - pos, ", \"press\":%.1f", press);
   } else {
-    pos += snprintf(buffer + pos, sizeof(buffer) - pos, ", \"press\":null");
+    pos += snprintf(buffer + pos, size - pos, ", \"press\":null");
   }
 
-  // Служебные поля
-  pos += snprintf(buffer + pos, sizeof(buffer) - pos, ", \"uptime\":%lu", millis() / 1000);
-  pos += snprintf(buffer + pos, sizeof(buffer) - pos, "}");
+  pos += snprintf(buffer + pos, size - pos, ", \"uptime\":%lu", millis() / 1000);
+  pos += snprintf(buffer + pos, size - pos, ", \"rssi\":%d", WiFi.RSSI());
+  pos += snprintf(buffer + pos, size - pos, "}");
+}
 
-  // --- ЭТАП 3: ОДНИМ ВЫСТРЕЛОМ ВЫВОД ---
+// ============== SETUP ==============
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println();
+  Serial.println("=== Dacha Weather Station v0.2 ===");
+
+  // --- Инициализация датчиков ---
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Serial.println("[I2C] OK");
+
+  dht.begin();
+  Serial.println("[AM2302] OK");
+
+  Wire.beginTransmission(BMP180_ADDR);
+  if (Wire.endTransmission() == 0) {
+    bmpReadCalibration();
+    bmpOk = true;
+    Serial.println("[BMP180] OK");
+  } else {
+    Serial.println("[BMP180] NOT FOUND");
+  }
+
+  // --- Wi-Fi Manager ---
+  // Если не может подключиться к сохранённой сети — создаёт точку доступа
+  // SSID: DachaWeather-XXXX (XXXX — уникальный ID чипа)
+  // Пароль: dacha1234
+  WiFi.mode(WIFI_STA);  // явно переводим в режим клиента
+  wm.setConfigPortalBlocking(false);  // не блокировать loop()
+  wm.setAPCallback([](WiFiManager* mgr) {
+    Serial.println("[WiFi] Entered config mode");
+    Serial.print("[WiFi] AP SSID: ");
+    Serial.println(mgr->getConfigPortalSSID());
+    Serial.println("[WiFi] Connect to this AP and open 192.168.4.1");
+  });
+
+  // Задаём кастомные параметры точки доступа
+  wm.setHostname("DachaWeather");  // имя устройства в сети
+  wm.setConfigPortalTimeout(300);  // таймаут портала 5 минут, потом перезагрузка
+
+  if (!wm.autoConnect("DachaWeather-Setup", "dacha1234")) {
+    Serial.println("[WiFi] Failed to connect, starting config portal...");
+  } else {
+    Serial.println("[WiFi] Connected!");
+    Serial.print("[WiFi] IP: ");
+    Serial.println(WiFi.localIP());
+  }
+
+  Serial.println();
+}
+
+// ============== LOOP ==============
+void loop() {
+  // Wi-Fi Manager должен крутиться в loop()
+  wm.process();
+
+  // Если не подключены к Wi-Fi — датчики не опрашиваем
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastRead < READ_INTERVAL) return;
+  lastRead = now;
+
+  char buffer[JSON_BUFFER_SIZE];
+  buildJson(buffer, sizeof(buffer));
   Serial.println(buffer);
 }
