@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <DHT.h>
 #include <WiFiManager.h>
+#include <PubSubClient.h>
 
 // ============== КОНФИГУРАЦИЯ ==============
 #define DHTPIN          4
@@ -11,10 +12,14 @@
 #define BMP180_ADDR     0x77
 #define JSON_BUFFER_SIZE 128
 #define READ_INTERVAL   10000      // 10 секунд
+#define MQTT_BROKER     "192.168.1.107"  // IP БРОКЕРА!
+#define MQTT_PORT       1883
 
 // ============== ОБЪЕКТЫ ==============
 DHT dht(DHTPIN, DHTTYPE);
 WiFiManager wm;
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
 
 // ============== BMP180 КАЛИБРОВКА ==============
 int16_t AC1, AC2, AC3, B1_, B2_, MB, MC, MD;
@@ -23,8 +28,10 @@ bool bmpOk = false;
 
 // ============== ПЕРЕМЕННЫЕ ==============
 unsigned long lastRead = 0;
+unsigned long lastMqttReconnect = 0;
+char mqttClientId[32];
 
-// ============== BMP180: ЧТЕНИЕ КАЛИБРОВКИ ==============
+// ============== BMP180 ==============
 void bmpReadCalibration() {
   Wire.beginTransmission(BMP180_ADDR);
   Wire.write(0xAA);
@@ -43,7 +50,6 @@ void bmpReadCalibration() {
   MD  = Wire.read() << 8 | Wire.read();
 }
 
-// ============== BMP180: ДАВЛЕНИЕ ==============
 float bmpReadPressure() {
   Wire.beginTransmission(BMP180_ADDR);
   Wire.write(0xF4);
@@ -135,12 +141,31 @@ void buildJson(char* buffer, size_t size) {
   pos += snprintf(buffer + pos, size - pos, "}");
 }
 
+// ============== MQTT: ПЕРЕПОДКЛЮЧЕНИЕ ==============
+void mqttReconnect() {
+  if (mqtt.connected()) return;
+
+  unsigned long now = millis();
+  if (now - lastMqttReconnect < 5000) return;  // не чаще раза в 5 секунд
+  lastMqttReconnect = now;
+
+  Serial.print("[MQTT] Connecting to broker... ");
+  if (mqtt.connect(mqttClientId)) {
+    Serial.println("OK");
+    // Здесь в будущем будем подписываться на топики команд
+  } else {
+    Serial.print("FAILED (rc=");
+    Serial.print(mqtt.state());
+    Serial.println(")");
+  }
+}
+
 // ============== SETUP ==============
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println();
-  Serial.println("=== Dacha Weather Station v0.2 ===");
+  Serial.println("=== Dacha Weather Station v0.3 ===");
 
   // --- Инициализация датчиков ---
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -159,48 +184,64 @@ void setup() {
   }
 
   // --- Wi-Fi Manager ---
-  // Если не может подключиться к сохранённой сети — создаёт точку доступа
-  // SSID: DachaWeather-XXXX (XXXX — уникальный ID чипа)
-  // Пароль: dacha1234
-  WiFi.mode(WIFI_STA);  // явно переводим в режим клиента
-  wm.setConfigPortalBlocking(false);  // не блокировать loop()
+  WiFi.mode(WIFI_STA);
+  wm.setConfigPortalBlocking(false);
   wm.setAPCallback([](WiFiManager* mgr) {
-    Serial.println("[WiFi] Entered config mode");
-    Serial.print("[WiFi] AP SSID: ");
-    Serial.println(mgr->getConfigPortalSSID());
-    Serial.println("[WiFi] Connect to this AP and open 192.168.4.1");
+    Serial.println("[WiFi] AP mode: DachaWeather-Setup / dacha1234");
   });
-
-  // Задаём кастомные параметры точки доступа
-  wm.setHostname("DachaWeather");  // имя устройства в сети
-  wm.setConfigPortalTimeout(300);  // таймаут портала 5 минут, потом перезагрузка
+  wm.setConfigPortalTimeout(300);
 
   if (!wm.autoConnect("DachaWeather-Setup", "dacha1234")) {
-    Serial.println("[WiFi] Failed to connect, starting config portal...");
+    Serial.println("[WiFi] Starting config portal...");
   } else {
     Serial.println("[WiFi] Connected!");
     Serial.print("[WiFi] IP: ");
     Serial.println(WiFi.localIP());
   }
 
+  // --- MQTT ---
+  snprintf(mqttClientId, sizeof(mqttClientId), "DachaWeather_%06X", 
+           (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  Serial.print("[MQTT] Client ID: ");
+  Serial.println(mqttClientId);
+  Serial.print("[MQTT] Broker: ");
+  Serial.print(MQTT_BROKER);
+  Serial.print(":");
+  Serial.println(MQTT_PORT);
+
   Serial.println();
 }
 
 // ============== LOOP ==============
+// ============== LOOP (исправленный интервал) ==============
 void loop() {
-  // Wi-Fi Manager должен крутиться в loop()
   wm.process();
 
-  // Если не подключены к Wi-Fi — датчики не опрашиваем
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
+  // MQTT — обслуживаем всегда
+  if (WiFi.status() == WL_CONNECTED) {
+    mqttReconnect();
+    mqtt.loop();
   }
 
+  // Опрос датчиков — СТРОГО по интервалу, без дрейфа
   unsigned long now = millis();
-  if (now - lastRead < READ_INTERVAL) return;
-  lastRead = now;
+  if (now - lastRead >= READ_INTERVAL) {
+    lastRead += READ_INTERVAL;  // <-- прибавляем, а не присваиваем now!
 
-  char buffer[JSON_BUFFER_SIZE];
-  buildJson(buffer, sizeof(buffer));
-  Serial.println(buffer);
+    // Если по какой-то причине отстали больше чем на 2 интервала — догоняем
+    if (now - lastRead > READ_INTERVAL) {
+      lastRead = now;
+    }
+
+    char buffer[JSON_BUFFER_SIZE];
+    buildJson(buffer, sizeof(buffer));
+    Serial.println(buffer);
+
+    if (mqtt.connected()) {
+      mqtt.publish("dacha/weather", buffer);
+    } else {
+      Serial.println("[MQTT] Not connected");
+    }
+  }
 }
