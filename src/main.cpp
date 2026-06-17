@@ -146,13 +146,34 @@ void mqttReconnect() {
   if (mqtt.connected()) return;
 
   unsigned long now = millis();
-  if (now - lastMqttReconnect < 5000) return;  // не чаще раза в 5 секунд
+  if (now - lastMqttReconnect < 5000) return;
   lastMqttReconnect = now;
 
-  Serial.print("[MQTT] Connecting to broker... ");
-  if (mqtt.connect(mqttClientId)) {
+  Serial.print("[MQTT] Connecting... ");
+
+  if (mqtt.connect(mqttClientId,
+                   NULL, NULL,
+                   "dacha/status", 0, true,
+                   "{\"status\":\"offline\"}")) {
+
     Serial.println("OK");
-    // Здесь в будущем будем подписываться на топики команд
+
+    // Online
+    mqtt.publish("dacha/status", "{\"status\":\"online\"}", true);
+
+    // Auto-discovery
+    char discovery[256];
+    snprintf(discovery, sizeof(discovery),
+      "{\"device_id\":\"%s\","
+      "\"device_type\":\"weather_station\","
+      "\"sensors\":[\"temperature\",\"humidity\",\"pressure\"],"
+      "\"model\":\"esp32-weather-v0.3\"}",
+      mqttClientId);
+    mqtt.publish("dacha/discovery", discovery, true);
+
+    Serial.print("[MQTT] Published discovery: ");
+    Serial.println(discovery);
+
   } else {
     Serial.print("FAILED (rc=");
     Serial.print(mqtt.state());
