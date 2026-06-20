@@ -19,7 +19,7 @@
 #define MQTT_BROKER     "192.168.1.107"  // IP БРОКЕРА!
 #define MQTT_PORT       8883
 #define MQTT_USER       "dacha"
-#define MQTT_PASSWORD   "****************"  // после первой прошивки сменить на """
+#define MQTT_PASSWORD   ""  // после первой прошивки сменить на ""
 
 // TLS: CA-сертификат (зашит в коде, это НЕ секрет)
 static const char CA_CERT[] PROGMEM = R"EOF(
@@ -83,31 +83,36 @@ void bmpReadCalibration() {
   MD  = Wire.read() << 8 | Wire.read();
 }
 
-float bmpReadPressure() {
+float bmpReadPressure(bool& ok) {
+  ok = false;  // по умолчанию — ошибка
+
+  // Запрос температуры
   Wire.beginTransmission(BMP180_ADDR);
   Wire.write(0xF4);
   Wire.write(0x2E);
-  Wire.endTransmission();
+  if (Wire.endTransmission() != 0) return 0;
   delay(5);
 
   Wire.beginTransmission(BMP180_ADDR);
   Wire.write(0xF6);
-  Wire.endTransmission();
-  Wire.requestFrom(BMP180_ADDR, 2);
+  if (Wire.endTransmission() != 0) return 0;
+  if (Wire.requestFrom(BMP180_ADDR, 2) != 2) return 0;
   int32_t UT = Wire.read() << 8 | Wire.read();
 
+  // Запрос давления
   Wire.beginTransmission(BMP180_ADDR);
   Wire.write(0xF4);
   Wire.write(0x34 | (3 << 6));
-  Wire.endTransmission();
+  if (Wire.endTransmission() != 0) return 0;
   delay(26);
 
   Wire.beginTransmission(BMP180_ADDR);
   Wire.write(0xF6);
-  Wire.endTransmission();
-  Wire.requestFrom(BMP180_ADDR, 3);
+  if (Wire.endTransmission() != 0) return 0;
+  if (Wire.requestFrom(BMP180_ADDR, 3) != 3) return 0;
   int32_t UP = ((Wire.read() << 16) | (Wire.read() << 8) | Wire.read()) >> (8 - 3);
 
+  // Расчёт
   int32_t X1 = ((UT - (int32_t)AC6) * (int32_t)AC5) >> 15;
   int32_t X2 = ((int32_t)MC << 11) / (X1 + MD);
   int32_t B5 = X1 + X2;
@@ -132,6 +137,7 @@ float bmpReadPressure() {
   X2 = (-7357 * p) >> 16;
   p = p + ((X1 + X2 + 3791) >> 4);
 
+  ok = true;  // успех
   return p / 133.322;
 }
 
@@ -144,8 +150,7 @@ void buildJson(char* buffer, size_t size) {
   float press   = 0.0;
   bool  pressOk = false;
   if (bmpOk) {
-    press = bmpReadPressure();
-    pressOk = (press > 0);
+    press = bmpReadPressure(pressOk);  // ← теперь с параметром
   }
 
   int pos = 0;
