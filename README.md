@@ -79,6 +79,60 @@ pio device monitor --baud 115200
 }
 ```
 
+## Как настроить сертификаты в Mosquitto
+
+```text
+sudo mkdir -p /etc/mosquitto/certs
+cd /etc/mosquitto/certs
+
+# 1. CA-ключ
+sudo openssl genrsa -out ca.key 2048
+
+# 2. CA-сертификат
+sudo openssl req -new -x509 -days 3650 -key ca.key -out ca.crt
+# Common Name: Dacha-CA (остальное произвольно)
+
+# 3. Ключ брокера
+sudo openssl genrsa -out broker.key 2048
+
+# 4. Запрос на сертификат брокера
+sudo openssl req -new -key broker.key -out broker.csr
+# Common Name: 192.168.1.107 (IP брокера, остальное произвольно)
+
+# 5. Подпись сертификата брокера
+sudo openssl x509 -req -in broker.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out broker.crt -days 3650
+
+# 6. Права
+sudo chown mosquitto:mosquitto /etc/mosquitto/certs/*
+sudo chown mosquitto:mosquitto /etc/mosquitto/passwd
+sudo chmod 644 /etc/mosquitto/certs/*.crt
+sudo chmod 600 /etc/mosquitto/certs/*.key
+sudo chmod 644 /etc/mosquitto/passwd
+
+# и дериктория с сртификатами доступна
+sudo chmod 755 /etc/mosquitto/certs
+
+# 7. Конфиг (/etc/mosquitto/mosquitto.conf)
+listener 1883 localhost
+allow_anonymous true
+
+listener 8883 0.0.0.0
+cafile   /etc/mosquitto/certs/ca.crt
+certfile /etc/mosquitto/certs/broker.crt
+keyfile  /etc/mosquitto/certs/broker.key
+require_certificate false
+
+password_file /etc/mosquitto/passwd
+allow_anonymous false
+
+# 8. Перезапуск
+sudo systemctl restart mosquitto
+sudo systemctl status mosquitto
+
+#9. Проверка TLS
+mosquitto_sub -h 192.168.1.107 -p 8883 --cafile /etc/mosquitto/certs/ca.crt -u dacha -P ТВОЙ_ПАРОЛЬ -t "dacha/#" -v
+```
+
 ## Дорожная карта
 - v0.1 Датчики, JSON в Serial
 - v0.2 Wi-Fi Manager с Captive Portal

@@ -3,6 +3,8 @@
 #include <DHT.h>
 #include <WiFiManager.h>
 #include <PubSubClient.h>
+#include <Preferences.h>
+#include <WiFiClientSecure.h>
 
 // ============== КОНФИГУРАЦИЯ ==============
 #define DHTPIN          4
@@ -12,13 +14,43 @@
 #define BMP180_ADDR     0x77
 #define JSON_BUFFER_SIZE 128
 #define READ_INTERVAL   10000      // 10 секунд
+
+// MQTT
 #define MQTT_BROKER     "192.168.1.107"  // IP БРОКЕРА!
-#define MQTT_PORT       1883
+#define MQTT_PORT       8883
+#define MQTT_USER       "dacha"
+#define MQTT_PASSWORD   "****************"  // после первой прошивки сменить на """
+
+// TLS: CA-сертификат (зашит в коде, это НЕ секрет)
+static const char CA_CERT[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDqzCCApOgAwIBAgIUchwwJCu3FqMYOUUiyCUWKaIf1pgwDQYJKoZIhvcNAQEL
+BQAwZTELMAkGA1UEBhMCUlUxEzARBgNVBAgMClNvbWUtU3RhdGUxDjAMBgNVBAcM
+BVRvbXNrMSEwHwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQxDjAMBgNV
+BAMMBWRhY2hhMB4XDTI2MDYxOTE5MDIwNFoXDTM2MDYxNjE5MDIwNFowZTELMAkG
+A1UEBhMCUlUxEzARBgNVBAgMClNvbWUtU3RhdGUxDjAMBgNVBAcMBVRvbXNrMSEw
+HwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQxDjAMBgNVBAMMBWRhY2hh
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6XWe9WL57g3vT/FRqzdU
+zUGJ+TtziDmJBHshKcb58C5/JGKQbp3q0CAwrtQuz34xxUjeM67sA0wWXTtuyNJ1
+JgSSKcW5y247F2bY77iOPP7HKr+6hDyo+ehYT5GaRpDTnaaBWBpZLGm1X8d8aiwS
+93qAgoAbohaMksv+rT7ACU1uC7/vdgR7gS6PWEOBLMdnrBKOBiv+UO5SYnPzyh7Q
+eI1hKWXyvc7pe+EjTxDdF93wM+hjeQoTMFDLIOOIsnR02HDwBIK4j9AUgD3oTrgo
+OSKWJLlxSz6sOgxDOOH95YZj5CuruhYQ/OPGfgeLbc0Ouh2UmbhkAuX5WMIJGS+w
+sQIDAQABo1MwUTAdBgNVHQ4EFgQURaIVwfgD/ymbYp3p4OLgxtNO9ewwHwYDVR0j
+BBgwFoAURaIVwfgD/ymbYp3p4OLgxtNO9ewwDwYDVR0TAQH/BAUwAwEB/zANBgkq
+hkiG9w0BAQsFAAOCAQEANPWHfQNqE8jgKx48XFYZA4jCO7yy6j72CMkuS9cYJV4K
+dR68kF0uSO+/QN7OUJ6XgomL4FJR0J9prrFDV+AWaTc1mBkKE5x2cEZj+bxoFP33
+IL6eZQYZ2v4mmExLAzSajyBtOz9JI0D5Q93Qt4qfk9rCivBGKVCETEkIvwKG7KAv
+mVgY7Z8jSVxMfkhaXfK3D7xNMsHGXfNgKe6b+HLLHT8cES5Fykwuoz6T+s0SuPdL
+4OLTRkW7xLT855GNO4FB4lZMJ5MkzrKzrUFK34LeEXJVFhWdRnt6N0qX5mApJef6
+bgekEk3kQahemzDBQYFIBBFnivN4PVuDZgf9oclQbA==
+-----END CERTIFICATE-----
+)EOF";
 
 // ============== ОБЪЕКТЫ ==============
 DHT dht(DHTPIN, DHTTYPE);
 WiFiManager wm;
-WiFiClient wifiClient;
+WiFiClientSecure wifiClient;
 PubSubClient mqtt(wifiClient);
 
 // ============== BMP180 КАЛИБРОВКА ==============
@@ -30,6 +62,7 @@ bool bmpOk = false;
 unsigned long lastRead = 0;
 unsigned long lastMqttReconnect = 0;
 char mqttClientId[32];
+String mqttPassword;
 
 // ============== BMP180 ==============
 void bmpReadCalibration() {
@@ -149,29 +182,27 @@ void mqttReconnect() {
   if (now - lastMqttReconnect < 5000) return;
   lastMqttReconnect = now;
 
-  Serial.print("[MQTT] Connecting... ");
+  Serial.print("[MQTT] Connecting TLS... ");
 
   if (mqtt.connect(mqttClientId,
-                   NULL, NULL,
+                   MQTT_USER, mqttPassword.c_str(),
                    "dacha/status", 0, true,
                    "{\"status\":\"offline\"}")) {
 
     Serial.println("OK");
 
-    // Online
     mqtt.publish("dacha/status", "{\"status\":\"online\"}", true);
 
-    // Auto-discovery
     char discovery[256];
     snprintf(discovery, sizeof(discovery),
       "{\"device_id\":\"%s\","
       "\"device_type\":\"weather_station\","
       "\"sensors\":[\"temperature\",\"humidity\",\"pressure\"],"
-      "\"model\":\"esp32-weather-v0.3\"}",
+      "\"model\":\"esp32-weather-v0.4\"}",
       mqttClientId);
     mqtt.publish("dacha/discovery", discovery, true);
 
-    Serial.print("[MQTT] Published discovery: ");
+    Serial.print("[MQTT] Discovery: ");
     Serial.println(discovery);
 
   } else {
@@ -186,7 +217,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println();
-  Serial.println("=== Dacha Weather Station v0.3 ===");
+  Serial.println("=== Dacha Weather Station v0.4 (TLS) ===");
 
   // --- Инициализация датчиков ---
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -204,12 +235,29 @@ void setup() {
     Serial.println("[BMP180] NOT FOUND");
   }
 
+  // --- Пароль MQTT из NVS ---
+  Preferences prefs;
+  prefs.begin("mqtt", false);
+
+  if (strlen(MQTT_PASSWORD) > 0) {
+    prefs.putString("password", MQTT_PASSWORD);
+    mqttPassword = MQTT_PASSWORD;
+    Serial.println("[NVS] Password saved from MQTT_PASSWORD");
+  } else {
+    mqttPassword = prefs.getString("password", "");
+    if (mqttPassword.isEmpty()) {
+      Serial.println("[NVS] WARNING: No password in NVS or code!");
+    } else {
+      Serial.print("[NVS] Password loaded from NVS (len=");
+      Serial.print(mqttPassword.length());
+      Serial.println(")");
+    }
+  }
+  prefs.end();
+
   // --- Wi-Fi Manager ---
   WiFi.mode(WIFI_STA);
   wm.setConfigPortalBlocking(false);
-  wm.setAPCallback([](WiFiManager* mgr) {
-    Serial.println("[WiFi] AP mode: DachaWeather-Setup / dacha1234");
-  });
   wm.setConfigPortalTimeout(300);
 
   if (!wm.autoConnect("DachaWeather-Setup", "dacha1234")) {
@@ -220,37 +268,29 @@ void setup() {
     Serial.println(WiFi.localIP());
   }
 
-  // --- MQTT ---
-  snprintf(mqttClientId, sizeof(mqttClientId), "DachaWeather_%06X", 
+  // --- MQTT + TLS ---
+  snprintf(mqttClientId, sizeof(mqttClientId), "DachaWeather_%06X",
            (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
+  wifiClient.setCACert(CA_CERT);
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-  Serial.print("[MQTT] Client ID: ");
-  Serial.println(mqttClientId);
-  Serial.print("[MQTT] Broker: ");
-  Serial.print(MQTT_BROKER);
-  Serial.print(":");
-  Serial.println(MQTT_PORT);
-
+  Serial.print("[MQTT] Client: "); Serial.println(mqttClientId);
+  Serial.print("[MQTT] Broker: "); Serial.print(MQTT_BROKER);
+  Serial.print(":"); Serial.println(MQTT_PORT);
   Serial.println();
 }
 
 // ============== LOOP ==============
-// ============== LOOP (исправленный интервал) ==============
 void loop() {
   wm.process();
 
-  // MQTT — обслуживаем всегда
   if (WiFi.status() == WL_CONNECTED) {
     mqttReconnect();
     mqtt.loop();
   }
 
-  // Опрос датчиков — СТРОГО по интервалу, без дрейфа
   unsigned long now = millis();
   if (now - lastRead >= READ_INTERVAL) {
-    lastRead += READ_INTERVAL;  // <-- прибавляем, а не присваиваем now!
-
-    // Если по какой-то причине отстали больше чем на 2 интервала — догоняем
+    lastRead += READ_INTERVAL;
     if (now - lastRead > READ_INTERVAL) {
       lastRead = now;
     }
