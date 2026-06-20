@@ -29,7 +29,7 @@
 - [x] JSON-формат вывода (Serial Monitor)
 - [x] Wi-Fi Manager с Captive Portal (настройка через телефон)
 - [x] MQTT: публикация данных и приём команд, status, LWT
-- [ ] TLS-шифрование
+- [x] TLS-шифрование
 - [ ] OTA-обновления
 - [ ] Watchdog и fail-safe
 

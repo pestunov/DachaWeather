@@ -21,6 +21,9 @@
 #define MQTT_USER       "dacha"
 #define MQTT_PASSWORD   ""  // после первой прошивки сменить на ""
 
+// Fail-safe: потеря связи > 5 минут → тревога
+#define FAILSAFE_TIMEOUT 300000  // 5 минут в миллисекундах
+
 // TLS: CA-сертификат (зашит в коде, это НЕ секрет)
 static const char CA_CERT[] PROGMEM = R"EOF(
 -----BEGIN CERTIFICATE-----
@@ -61,6 +64,8 @@ bool bmpOk = false;
 // ============== ПЕРЕМЕННЫЕ ==============
 unsigned long lastRead = 0;
 unsigned long lastMqttReconnect = 0;
+unsigned long lastMqttOk = 0;         // когда был последний успешный MQTT-обмен
+bool failsafeTriggered = false;
 char mqttClientId[32];
 String mqttPassword;
 
@@ -179,6 +184,91 @@ void buildJson(char* buffer, size_t size) {
   pos += snprintf(buffer + pos, size - pos, "}");
 }
 
+// ============== ОТПРАВКА ACK/NACK ==============
+void sendAck(const char* cmd, bool success, const char* reason = nullptr) {
+  char response[128];
+  if (success) {
+    snprintf(response, sizeof(response), "{\"cmd\":\"%s\",\"result\":\"ack\"}", cmd);
+  } else {
+    snprintf(response, sizeof(response), "{\"cmd\":\"%s\",\"result\":\"nack\",\"reason\":\"%s\"}", cmd, reason ? reason : "unknown");
+  }
+  mqtt.publish("dacha/command/response", response);
+  Serial.print("[CMD] Response: ");
+  Serial.println(response);
+}
+
+// ============== ОБРАБОТКА КОМАНД ==============
+void handleCommand(const char* cmd, const char* payload) {
+  Serial.print("[CMD] Received: ");
+  Serial.println(payload);
+
+  // --- RESTART ---
+  if (strcmp(cmd, "RESTART") == 0) {
+    sendAck("RESTART", true);
+    delay(100);  // дать уйти ack
+    ESP.restart();
+  }
+
+  // --- STATUS ---
+  else if (strcmp(cmd, "STATUS") == 0) {
+    char status[256];
+    snprintf(status, sizeof(status),
+      "{\"uptime\":%lu,\"rssi\":%d,\"free_heap\":%u,\"mqtt_connected\":%s,\"failsafe\":%s}",
+      millis() / 1000,
+      WiFi.RSSI(),
+      ESP.getFreeHeap(),
+      mqtt.connected() ? "true" : "false",
+      failsafeTriggered ? "true" : "false");
+    mqtt.publish("dacha/status", status);
+    sendAck("STATUS", true);
+  }
+
+  // --- Неизвестная команда ---
+  else {
+    sendAck(cmd, false, "unknown command");
+  }
+}
+
+// ============== MQTT CALLBACK ==============
+void mqttCallback(char* topic, byte* message, unsigned int length) {
+  // Пришло сообщение — сбрасываем таймер fail-safe
+  lastMqttOk = millis();
+
+  // Преобразуем payload в строку
+  char payload[128];
+  unsigned int len = length < 127 ? length : 127;
+  memcpy(payload, message, len);
+  payload[len] = '\0';
+
+  Serial.print("[MQTT] Message: ");
+  Serial.print(topic);
+  Serial.print(" → ");
+  Serial.println(payload);
+
+  // Парсим JSON: ищем "cmd"
+  // Простой парсер без библиотек — ищем ключ "cmd"
+  char cmd[32] = "";
+  const char* cmdStart = strstr(payload, "\"cmd\"");
+  if (cmdStart) {
+    cmdStart = strchr(cmdStart, ':');
+    if (cmdStart) {
+      cmdStart++; // пропускаем ':'
+      while (*cmdStart == ' ' || *cmdStart == '"') cmdStart++;
+      int i = 0;
+      while (*cmdStart && *cmdStart != '"' && *cmdStart != ' ' && i < 31) {
+        cmd[i++] = *cmdStart++;
+      }
+      cmd[i] = '\0';
+    }
+  }
+
+  if (strlen(cmd) > 0) {
+    handleCommand(cmd, payload);
+  } else {
+    sendAck("unknown", false, "no cmd field");
+  }
+}
+
 // ============== MQTT: ПЕРЕПОДКЛЮЧЕНИЕ ==============
 void mqttReconnect() {
   if (mqtt.connected()) return;
@@ -195,6 +285,7 @@ void mqttReconnect() {
                    "{\"status\":\"offline\"}")) {
 
     Serial.println("OK");
+    lastMqttOk = millis();  // сброс таймера fail-safe
 
     mqtt.publish("dacha/status", "{\"status\":\"online\"}", true);
 
@@ -203,12 +294,17 @@ void mqttReconnect() {
       "{\"device_id\":\"%s\","
       "\"device_type\":\"weather_station\","
       "\"sensors\":[\"temperature\",\"humidity\",\"pressure\"],"
-      "\"model\":\"esp32-weather-v0.4\"}",
+      "\"commands\":[\"RESTART\",\"STATUS\"],"
+      "\"model\":\"esp32-weather-v0.5\"}",
       mqttClientId);
     mqtt.publish("dacha/discovery", discovery, true);
 
     Serial.print("[MQTT] Discovery: ");
     Serial.println(discovery);
+
+    // --- ПОДПИСКА НА КОМАНДЫ ---
+    mqtt.subscribe("dacha/command");
+    Serial.println("[MQTT] Subscribed to dacha/command");
 
   } else {
     Serial.print("FAILED (rc=");
@@ -217,14 +313,35 @@ void mqttReconnect() {
   }
 }
 
+// ============== FAIL-SAFE ПРОВЕРКА ==============
+void checkFailsafe() {
+  if (!mqtt.connected()) return;  // нет связи — не считаем
+
+  unsigned long now = millis();
+  if (now - lastMqttOk > FAILSAFE_TIMEOUT) {
+    if (!failsafeTriggered) {
+      failsafeTriggered = true;
+      Serial.println("[FAILSAFE] TRIGGERED! Connection lost > 5 min");
+      mqtt.publish("dacha/status", "{\"status\":\"failsafe\"}", true);
+      // Здесь в будущем: digitalWrite(RELAY_PIN, LOW);
+    }
+  } else {
+    if (failsafeTriggered) {
+      failsafeTriggered = false;
+      Serial.println("[FAILSAFE] Cleared. Connection restored");
+      mqtt.publish("dacha/status", "{\"status\":\"online\"}", true);
+    }
+  }
+}
+
 // ============== SETUP ==============
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println();
-  Serial.println("=== Dacha Weather Station v0.4 (TLS) ===");
+  Serial.println("=== Dacha Weather Station v0.5 (Commands) ===");
 
-  // --- Инициализация датчиков ---
+  // --- Датчики ---
   Wire.begin(I2C_SDA, I2C_SCL);
   Serial.println("[I2C] OK");
 
@@ -240,27 +357,25 @@ void setup() {
     Serial.println("[BMP180] NOT FOUND");
   }
 
-  // --- Пароль MQTT из NVS ---
+  // --- Пароль MQTT ---
   Preferences prefs;
   prefs.begin("mqtt", false);
 
   if (strlen(MQTT_PASSWORD) > 0) {
     prefs.putString("password", MQTT_PASSWORD);
     mqttPassword = MQTT_PASSWORD;
-    Serial.println("[NVS] Password saved from MQTT_PASSWORD");
+    Serial.println("[NVS] Password saved");
   } else {
     mqttPassword = prefs.getString("password", "");
     if (mqttPassword.isEmpty()) {
-      Serial.println("[NVS] WARNING: No password in NVS or code!");
+      Serial.println("[NVS] WARNING: No password!");
     } else {
-      Serial.print("[NVS] Password loaded from NVS (len=");
-      Serial.print(mqttPassword.length());
-      Serial.println(")");
+      Serial.println("[NVS] Password loaded from NVS");
     }
   }
   prefs.end();
 
-  // --- Wi-Fi Manager ---
+  // --- Wi-Fi ---
   WiFi.mode(WIFI_STA);
   wm.setConfigPortalBlocking(false);
   wm.setConfigPortalTimeout(300);
@@ -273,14 +388,13 @@ void setup() {
     Serial.println(WiFi.localIP());
   }
 
-  // --- MQTT + TLS ---
+  // --- MQTT ---
   snprintf(mqttClientId, sizeof(mqttClientId), "DachaWeather_%06X",
            (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
   wifiClient.setCACert(CA_CERT);
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
   Serial.print("[MQTT] Client: "); Serial.println(mqttClientId);
-  Serial.print("[MQTT] Broker: "); Serial.print(MQTT_BROKER);
-  Serial.print(":"); Serial.println(MQTT_PORT);
   Serial.println();
 }
 
@@ -293,6 +407,10 @@ void loop() {
     mqtt.loop();
   }
 
+  // Fail-safe проверка
+  checkFailsafe();
+
+  // Опрос датчиков
   unsigned long now = millis();
   if (now - lastRead >= READ_INTERVAL) {
     lastRead += READ_INTERVAL;
@@ -311,3 +429,4 @@ void loop() {
     }
   }
 }
+
