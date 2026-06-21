@@ -5,6 +5,8 @@
 #include <PubSubClient.h>
 #include <Preferences.h>
 #include <WiFiClientSecure.h>
+#include <Update.h>           // ← OTA
+#include <HTTPClient.h>       // ← для скачивания прошивки
 
 // ============== КОНФИГУРАЦИЯ ==============
 #define DHTPIN          4
@@ -68,6 +70,9 @@ unsigned long lastMqttOk = 0;         // когда был последний у
 bool failsafeTriggered = false;
 char mqttClientId[32];
 String mqttPassword;
+
+// OTA
+bool otaInProgress = false;
 
 // ============== BMP180 ==============
 void bmpReadCalibration() {
@@ -197,6 +202,73 @@ void sendAck(const char* cmd, bool success, const char* reason = nullptr) {
   Serial.println(response);
 }
 
+// ============== OTA: СКАЧИВАНИЕ И УСТАНОВКА ==============
+void performOTA(const char* url) {
+  Serial.print("[OTA] Downloading: ");
+  Serial.println(url);
+
+  HTTPClient http;
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode != 200) {
+    Serial.printf("[OTA] HTTP error: %d\n", httpCode);
+    sendAck("OTA_UPDATE", false, "HTTP download failed");
+    http.end();
+    return;
+  }
+
+  int contentLength = http.getSize();
+  Serial.printf("[OTA] Size: %d bytes\n", contentLength);
+
+  if (contentLength <= 0) {
+    Serial.println("[OTA] Empty response");
+    sendAck("OTA_UPDATE", false, "empty response");
+    http.end();
+    return;
+  }
+
+  // Начинаем OTA
+  if (!Update.begin(contentLength)) {
+    Serial.printf("[OTA] Begin failed: %s\n", Update.errorString());
+    sendAck("OTA_UPDATE", false, Update.errorString());
+    http.end();
+    return;
+  }
+
+  // Пишем потоком
+  WiFiClient* stream = http.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+
+  if (written != contentLength) {
+    Serial.printf("[OTA] Write failed: %d/%d\n", written, contentLength);
+    sendAck("OTA_UPDATE", false, "write failed");
+    http.end();
+    return;
+  }
+
+  if (!Update.end()) {
+    Serial.printf("[OTA] End failed: %s\n", Update.errorString());
+    sendAck("OTA_UPDATE", false, Update.errorString());
+    http.end();
+    return;
+  }
+
+  if (!Update.isFinished()) {
+    Serial.println("[OTA] Not finished");
+    sendAck("OTA_UPDATE", false, "not finished");
+    http.end();
+    return;
+  }
+
+  http.end();
+  Serial.println("[OTA] SUCCESS. Rebooting in 2 seconds...");
+  sendAck("OTA_UPDATE", true);
+
+  delay(2000);
+  ESP.restart();
+}
+
 // ============== ОБРАБОТКА КОМАНД ==============
 void handleCommand(const char* cmd, const char* payload) {
   Serial.print("[CMD] Received: ");
@@ -221,6 +293,29 @@ void handleCommand(const char* cmd, const char* payload) {
       failsafeTriggered ? "true" : "false");
     mqtt.publish("dacha/status", status);
     sendAck("STATUS", true);
+  }
+
+  // --- OTA_UPDATE ---
+  else if (strcmp(cmd, "OTA_UPDATE") == 0) {
+    // Ищем URL в payload: {"cmd":"OTA_UPDATE","url":"http://..."}
+    const char* urlStart = strstr(payload, "\"url\"");
+    if (urlStart) {
+      urlStart = strchr(urlStart, ':');
+      if (urlStart) {
+        urlStart++;
+        while (*urlStart == ' ' || *urlStart == '"') urlStart++;
+        char url[256];
+        int i = 0;
+        while (*urlStart && *urlStart != '"' && i < 255) {
+          url[i++] = *urlStart++;
+        }
+        url[i] = '\0';
+        Serial.printf("[CMD] OTA URL: %s\n", url);
+        performOTA(url);
+        return;
+      }
+    }
+    sendAck("OTA_UPDATE", false, "missing url");
   }
 
   // --- Неизвестная команда ---
@@ -294,8 +389,8 @@ void mqttReconnect() {
       "{\"device_id\":\"%s\","
       "\"device_type\":\"weather_station\","
       "\"sensors\":[\"temperature\",\"humidity\",\"pressure\"],"
-      "\"commands\":[\"RESTART\",\"STATUS\"],"
-      "\"model\":\"esp32-weather-v0.5\"}",
+      "\"commands\":[\"RESTART\",\"STATUS\",\"OTA_UPDATE\"],"
+      "\"model\":\"esp32-weather-v0.61\"}",
       mqttClientId);
     mqtt.publish("dacha/discovery", discovery, true);
 
@@ -339,7 +434,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println();
-  Serial.println("=== Dacha Weather Station v0.5 (Commands) ===");
+  Serial.println("=== Dacha Weather Station v0.6 (OTA) ===");
 
   // --- Датчики ---
   Wire.begin(I2C_SDA, I2C_SCL);
