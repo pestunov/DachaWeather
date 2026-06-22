@@ -30,8 +30,8 @@
 - [x] Wi-Fi Manager с Captive Portal (настройка через телефон)
 - [x] MQTT: публикация данных и приём команд, status, LWT
 - [x] TLS-шифрование
-- [ ] OTA-обновления
-- [ ] Watchdog и fail-safe
+- [x] OTA-обновления
+- [x] Watchdog и fail-safe
 
 ## Сборка и прошивка
 
